@@ -10,7 +10,7 @@
 #include "LoRaBoards.h"
 #include "utilities.h"
 #include "tmp117.h"
-#include "max30102"
+#include "max30102.h"
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <RadioLib.h>
@@ -28,7 +28,7 @@ constexpr uint32_t LEADER_RECEIVE_MS = 4000;
 
 //Lora defines
 #ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           850.0
+#define CONFIG_RADIO_FREQ           915.0
 #endif
 
 #ifndef CONFIG_RADIO_OUTPUT_POWER
@@ -51,7 +51,7 @@ float myTempF = 0.0f;
 
 //MAX30102 Globals
 HRSensor hrSensor(Wire);
-int myAvgBPM; 
+
 
 //Lora 
 SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
@@ -73,10 +73,12 @@ void setFlag(void)
 }
 
 
+
 struct BoardInfo {
   uint8_t id;
   uint8_t batteryPercent;
   float temp;
+  int avgBPM;
   String address;
   uint8_t addressType;
   bool isSelf;
@@ -87,6 +89,7 @@ struct ReceivedPacket {
   uint8_t id;
   uint8_t batteryPercent;
   float temp;
+  int avgBPM;
   String address;
   String payload;
   uint32_t timeReceivedMs;
@@ -98,7 +101,25 @@ ReceivedPacket receivedPackets[MAX_NUM_BOARDS];
 BoardInfo boards[MAX_NUM_BOARDS];
 int boardCount = 0;
 
+enum class CycleState {
+    START_CYCLE,
+    SCANNING,
+    ELECT_LEADER,
+    FOLLOWER_WAIT,
+    LEADER_WAIT,
+    LORA_TRANSMITTING,
+    WAIT_FOR_NEXT_CYCLE
+};
 
+CycleState cycleState = CycleState::START_CYCLE;
+
+uint32_t cycleStartMs = 0;
+uint32_t stateStartMs = 0;
+
+volatile bool scanFinished = false;
+bool loraTransmitActive = false;
+
+BoardInfo selectedLeader;
 
 uint8_t knownBoardIds[MAX_NUM_BOARDS] = {
   0,
@@ -119,10 +140,10 @@ uint8_t myId = THIS_BOARD_ID;
 String myName;
 
 uint8_t myBatteryPercent = 0;
-uint16_t myBatteryMv = 0;
+int myAvgBPM = 0;
 
 uint32_t sampleCounter = 0;
-
+bool hrReady;
 NimBLECharacteristic *rxCharacteristic = nullptr;
 
 //Battery functions
@@ -144,19 +165,6 @@ uint8_t getBatteryPercent(){
   return (uint8_t)percent;
 }
 
-// uint16_t getBatteryVoltageMv() {
-//   int batteryVoltageMv = 0;
-//   if(USE_FAKE_BATTERY){
-//     batteryVoltageMv = 3700;
-//   }
-//   else{
-//     if(PMU && PMU->isBatteryConnect()){
-//       batteryVoltageMv = PMU->getBattVoltage();
-//     }
-//   }
-//   return (uint16_t)batteryVoltageMv;
-// }
-
 void updateMyBatteryValues() {
   myBatteryPercent = getBatteryPercent();
   // myBatteryMv = getBatteryVoltageMv();
@@ -167,11 +175,12 @@ void clearBoardList(){
   boardCount = 0;
 }
 
-void addOrUpdateBoards(uint8_t id, uint8_t percentage, float temp, String address, uint8_t addressType, bool isSelf){
+void addOrUpdateBoards(uint8_t id, uint8_t percentage, float temp, int avgBPM, String address, uint8_t addressType, bool isSelf){
   for(int i = 0; i < boardCount; i++){    //if board count is 0, this for loop does not run
     if(boards[i].id == id){   //skip boards already discovered
       boards[i].batteryPercent = percentage;
       boards[i].temp = temp;
+      boards[i].avgBPM = avgBPM;
       boards[i].address = address;
       boards[i].addressType = addressType;
       boards[i].isSelf = isSelf;
@@ -183,6 +192,7 @@ void addOrUpdateBoards(uint8_t id, uint8_t percentage, float temp, String addres
     boards[boardCount].id = id;
     boards[boardCount].batteryPercent = percentage;
     boards[boardCount].temp = temp;
+    boards[boardCount].avgBPM = avgBPM;
     boards[boardCount].address = address;
     boards[boardCount].addressType = addressType;
     boards[boardCount].isSelf = isSelf;
@@ -191,7 +201,7 @@ void addOrUpdateBoards(uint8_t id, uint8_t percentage, float temp, String addres
 }
 
 void addSelftoBoardList(){
-  addOrUpdateBoards(myId, myBatteryPercent, myTempF, "SELF", 0, true);
+  addOrUpdateBoards(myId, myBatteryPercent, myTempF, myAvgBPM, "SELF", 0, true);
 }
 
 bool isBoardALeader(const BoardInfo& a, const BoardInfo& b){
@@ -224,22 +234,25 @@ int findLeaderIndex(){
   return bestIndex;
 }
 
-bool parsePacket(String payload, uint8_t &id, uint8_t &percent, float &temp){
+bool parsePacket(String payload, uint8_t &id, uint8_t &percent, float &temp, int &avgBPM){
   int idIndex = payload.indexOf("id=");
   int percentIndex = payload.indexOf(",battPercent=");
   int tempIndex = payload.indexOf(",temp=");
+  int avgBPMIndex = payload.indexOf(",avgBPM=");
 
-  if (idIndex < 0 || percentIndex < 0 || tempIndex < 0) {
+  if (idIndex < 0 || percentIndex < 0 || tempIndex < 0 || avgBPMIndex < 0) {
     return false;
   }
 
   String idStr = payload.substring(idIndex + 3, percentIndex);
   String percentStr = payload.substring(percentIndex + 13, tempIndex);
-  String tempStr = payload.substring(tempIndex + 6);
+  String tempStr = payload.substring(tempIndex + 6, avgBPMIndex);
+  String avgBPMStr = payload.substring(avgBPMIndex + 8);
 
   id = (uint8_t)strtol(idStr.c_str(), nullptr, 16);  // because you send ID using HEX
   percent = (uint8_t)percentStr.toInt();
   temp = tempStr.toFloat();
+  avgBPM = avgBPMStr.toInt();
 
   return true;
 }
@@ -248,7 +261,8 @@ void storeReceivedPacket(String payload, String address){
   uint8_t id;
   uint8_t percent;
   float temp;
-  if(!parsePacket(payload, id, percent, temp)){
+  int avgBPM;
+  if(!parsePacket(payload, id, percent, temp, avgBPM)){
     Serial.println("Could not parse received BLE payload.");
     return;
   }
@@ -256,6 +270,7 @@ void storeReceivedPacket(String payload, String address){
     if(receivedPackets[i].valid && receivedPackets[i].id == id){   //update existing packet
       receivedPackets[i].batteryPercent = percent;
       receivedPackets[i].temp = temp;
+      receivedPackets[i].avgBPM = avgBPM;
       receivedPackets[i].address = address;
       receivedPackets[i].payload = payload;
       receivedPackets[i].timeReceivedMs = millis();
@@ -268,6 +283,7 @@ void storeReceivedPacket(String payload, String address){
       receivedPackets[i].id = id;
       receivedPackets[i].batteryPercent = percent;
       receivedPackets[i].temp = temp;
+      receivedPackets[i].avgBPM = avgBPM;
       receivedPackets[i].address = address;
       receivedPackets[i].payload = payload;
       receivedPackets[i].timeReceivedMs = millis();
@@ -333,6 +349,12 @@ void updateAdvertisement() {
   uint16_t tempBits =
         static_cast<uint16_t>(tempHundredths);
 
+  uint8_t bpmByte =
+    static_cast<uint8_t>(
+        constrain(myAvgBPM, 0, 255)
+    );
+
+
   std::string data;
   data.push_back('T');
   data.push_back('B');
@@ -340,6 +362,7 @@ void updateAdvertisement() {
   data.push_back((char)myBatteryPercent);
   data.push_back(static_cast<char>(tempBits >> 8));
   data.push_back(static_cast<char>(tempBits & 0xFF));
+  data.push_back(static_cast<char>(bpmByte));
 
   advData.setManufacturerData(data);
 
@@ -358,7 +381,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     }
 
     std::string data = device->getManufacturerData();   //get data from advertised board
-    if(data.length() < 6){
+    if(data.length() < 7){
       return;
     }
 
@@ -390,29 +413,23 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 
     
     peerTempF = peerTempHundredths / 100.0f;
-
+    uint8_t peerAvgBPM =
+    static_cast<uint8_t>(data[6]);
 
     String peerAddress = device->getAddress().toString().c_str();
     uint8_t peerAddressType = device->getAddressType();
 
-    addOrUpdateBoards(peerId, peerBatteryPercent, peerTempF, peerAddress, peerAddressType, false);
-        Serial.println("Found T-Beam node:");
-        Serial.print("  Address: ");
-        Serial.println(peerAddress);
+    addOrUpdateBoards(peerId, peerBatteryPercent, peerTempF, peerAvgBPM, peerAddress, peerAddressType, false);
 
-        Serial.print("  ID: 0x");
-        Serial.println(peerId, HEX);
+  }
+  void onScanEnd(const NimBLEScanResults &results, int reason) override{
+    scanFinished = true;
+    Serial.println("BLE scan complete.");
 
-        Serial.print("  Battery: ");
-        Serial.print(peerBatteryPercent);
-        Serial.println("%");
-
-        Serial.print("  Temp: ");
-        Serial.print(peerTempF);
-        Serial.println("F");
-
-        Serial.println();
-
+    Serial.print("Boards found including self: ");
+    Serial.println(boardCount);
+    Serial.print("BLE scan ended, reason: ");
+    Serial.println(reason);
   }
 };
 
@@ -429,23 +446,19 @@ void setUpScanner(){
   Serial.println("BLE scanner initialized");
 }
 
-void scanForBoards(){
+bool startBoardScan(){
   clearBoardList();
   addSelftoBoardList();
+  
+  scanFinished = false;
   NimBLEScan *scan = NimBLEDevice::getScan();
-  Serial.println();
-  Serial.println("Starting scan");
+  Serial.println("Starting nonblocking BLE scan.");
+  
 
-  scan->getResults(SCAN_TIME_MS, false);
-
-  Serial.println("Scan complete");
-  Serial.println("Total boards found including myself: ");
-  Serial.print(boardCount);
-  Serial.println();
-
+  return scan->start(SCAN_TIME_MS, false, true); //scan for SCAN_TIME_MS, does not clear the old scan results before starting, will restart scan if scan is already active
 }
 
-//send data to leader
+//send data to leader via Bluetooth
 String makePayload(){
   String payload = "";
   payload += "id=";
@@ -454,6 +467,8 @@ String makePayload(){
   payload += String(myBatteryPercent);
   payload += ",temp=";
   payload += String(myTempF, 2);
+  payload += ",avgBPM=";
+  payload += String(myAvgBPM);
   return payload;
 
 }
@@ -644,18 +659,154 @@ void clearReceivedPackets(){
   }
 }
 
-void waitForCycleEnd(uint32_t cycleStart)
-{
-    uint32_t elapsed = millis() - cycleStart;
 
-    if (elapsed < CYCLE_TIME_MS) {
-        delay(CYCLE_TIME_MS - elapsed);
-    } else {
-        Serial.print("Cycle overrun: ");
-        Serial.print(elapsed);
-        Serial.println(" ms");
+void buildLoraPayload(){
+  loraPayload = "";
+  loraPayload += makePayload();
+
+  for(int i = 0; i < MAX_NUM_BOARDS; i++){
+    if(receivedPackets[i].valid){
+      loraPayload += ";";
+      loraPayload += receivedPackets[i].payload;      
     }
+  }
+  Serial.print("LoRa payload: ");
+  Serial.println(loraPayload);
 }
+
+void runFSM(){
+  uint32_t now = millis();
+
+  switch (cycleState){
+    case CycleState::START_CYCLE:
+    {
+      cycleStartMs = now;
+      clearReceivedPackets();
+      updateMyBatteryValues();
+      if(tmp117Ready){
+        tempValid = tempSensor.readTemp(myTempF);
+        if(tempValid){
+          Serial.print("Temperature: ");
+          Serial.print(myTempF);
+          Serial.println(" F");
+        }
+        else{
+          Serial.println("Temperature read failed");
+        }
+      }
+      else{
+        tempValid = false;
+      }
+      updateAdvertisement(); 
+      if(!startBoardScan()){
+        Serial.println("Failed to start scan.");
+        cycleState = CycleState::WAIT_FOR_NEXT_CYCLE;
+        break;
+      }
+      cycleState = CycleState::SCANNING;
+      break;
+    }
+    case CycleState::SCANNING:
+    {
+      if(!scanFinished){
+        break;
+      }
+      Serial.print("Boards found: "); 
+      Serial.println(boardCount);
+
+      cycleState = CycleState::ELECT_LEADER;
+      break;
+    }
+    case CycleState::ELECT_LEADER:
+    {
+      if (boardCount < MAX_NUM_BOARDS) {
+        Serial.println("Not all expected boards were found. Skipping this cycle.");
+        cycleState = CycleState::WAIT_FOR_NEXT_CYCLE;
+        break;
+      }
+
+      int leaderIndex = findLeaderIndex();
+
+      if(leaderIndex < 0){
+        Serial.println("No leader found");
+        cycleState = CycleState::WAIT_FOR_NEXT_CYCLE;
+        break;
+      }
+      selectedLeader = boards[leaderIndex];
+      stateStartMs = now;
+
+      if(selectedLeader.isSelf){
+        Serial.println("I am the highest-battery board. Waiting to receive data.");
+        cycleState = CycleState::LEADER_WAIT;
+      }
+      else{
+        Serial.println( "I am follower; waiting for send slot." );
+        cycleState = CycleState::FOLLOWER_WAIT;
+      }
+      break;
+    }
+    case CycleState::FOLLOWER_WAIT:
+    {
+      uint32_t sendDelay = 500 + (myId % 5) * 1000;
+      if(now - stateStartMs < sendDelay){
+        break;
+      }
+      sendDatatoLeader(selectedLeader);
+      cycleState = CycleState::WAIT_FOR_NEXT_CYCLE;
+      break;
+    }
+    case CycleState::LEADER_WAIT:
+    {
+      if(now - stateStartMs < LEADER_RECEIVE_MS){
+        break;
+      }
+      NimBLEDevice::getAdvertising()->stop();
+      buildLoraPayload();
+      transmittedFlag = false;
+      int transmissionState = radio.startTransmit(loraPayload.c_str());
+      
+      if (transmissionState == RADIOLIB_ERR_NONE) {
+        Serial.println("LoRa transmit started.");
+      } 
+      else {
+        Serial.print("LoRa transmit failed, code ");
+        Serial.println(transmissionState);
+        cycleState = CycleState::WAIT_FOR_NEXT_CYCLE;
+        break;
+      }
+      loraTransmitActive = true;
+      cycleState = CycleState::LORA_TRANSMITTING;
+      break;
+    }
+    case CycleState::LORA_TRANSMITTING:
+    {
+      if(!transmittedFlag){
+        break;
+      }
+      transmittedFlag = false;
+      loraTransmitActive = false;
+      int state = radio.finishTransmit();
+      if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("LoRa transmit success.");
+      } else {
+        Serial.print("LoRa finish failed, code ");
+        Serial.println(state);
+      }
+      cycleState = CycleState::WAIT_FOR_NEXT_CYCLE;
+      break;
+    }
+    case CycleState::WAIT_FOR_NEXT_CYCLE:
+    {
+      if (now - cycleStartMs < CYCLE_TIME_MS) {
+         break; 
+      }
+      cycleState = CycleState::START_CYCLE;
+      break;
+    }
+  }
+}
+
+
 
 void setup() {
   // put your setup code here, to run once:
@@ -679,8 +830,12 @@ void setup() {
     Serial.println("Temp sensor initialized");
   }
 
-  hrSensor.begin();
-  
+  hrReady = hrSensor.begin();
+  if (hrReady) {
+    Serial.println("MAX30102 initialized.");
+} else {
+    Serial.println("MAX30102 initialization failed.");
+}
 
   myName = "Board_";
   myName += String(myId);
@@ -689,114 +844,22 @@ void setup() {
 
   setupBleServer();
   setUpScanner();
-
-  updateAdvertisement();
   setupLora();
 
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-    uint32_t cycleStart = millis();  
-    clearReceivedPackets();
-    updateMyBatteryValues();
-    if(tmp117Ready){
-      tempValid = tempSensor.readTemp(myTempF);
-      if(tempValid){
-        Serial.print("Temperature: ");
-        Serial.print(myTempF);
-        Serial.println(" F");
-      }
-      else{
-        Serial.println("Temperature read failed");
-      }
-    }
-    else{
-      tempValid = false;
-    } 
+  if(hrReady){
     hrSensor.update();
     myAvgBPM = hrSensor.getAverageBPM();
-
-
-    updateAdvertisement();
-    scanForBoards();
-
-    if (boardCount < MAX_NUM_BOARDS) {
-      Serial.println("Not all expected boards were found. Skipping this cycle.");
-      waitForCycleEnd(cycleStart);
-      return;
-    }
-
-    int leaderIndex = findLeaderIndex();
-
-    if(leaderIndex < 0){
-      Serial.println("No leader found");
-      waitForCycleEnd(cycleStart);
-      return;
-    }
-  BoardInfo leader = boards[leaderIndex];
-
-  Serial.println();
-  Serial.println("========= LEADER RESULT =========");
-  Serial.print("Leader ID: 0x");
-  Serial.println(leader.id, HEX);
-
-  Serial.print("Leader battery: ");
-  Serial.print(leader.batteryPercent);
-  Serial.println("%");
-  Serial.print("Leader temperature: ");
-  Serial.print(leader.temp);
-  Serial.println(" F");
-
-  Serial.print("Leader address: ");
-  Serial.println(leader.address);
-
-  Serial.print("Am I leader? ");
-  Serial.println(leader.isSelf ? "YES" : "NO");
-  Serial.println("=================================");
-  Serial.println();
-
-  if(leader.isSelf){
-    Serial.println("I am the highest-battery board. Waiting to receive data.");
-    // Give other boards time to connect and write their BLE payloads
-    delay(LEADER_RECEIVE_MS);
-    // No more connections expected this cycle.
-    NimBLEDevice::getAdvertising()->stop();
-    loraPayload = "";
-    loraPayload += makePayload();
-
-    for(int i = 0; i < MAX_NUM_BOARDS; i++){
-      if(receivedPackets[i].valid){
-        loraPayload += ";";
-        loraPayload += receivedPackets[i].payload;
-      }
-    }
-
-  Serial.print("LoRa payload: ");
-  Serial.println(loraPayload);
-
-  transmissionState = radio.transmit(loraPayload);
-
-    if (transmissionState == RADIOLIB_ERR_NONE) {
-      Serial.println("LoRa transmit success.");
-    } 
-    else {
-      Serial.print("LoRa transmit failed, code ");
-      Serial.println(transmissionState);
-    }
   }
   else{
-    uint32_t sendDelay = 500 + (myId % 5) * 1000;
-    Serial.print("I am not leader. Waiting ");
-    Serial.print(sendDelay);
-    Serial.println(" ms before sending.");
-    delay(sendDelay);
-
-    sendDatatoLeader(leader);
+    myAvgBPM = 0;
   }
-
-
-  waitForCycleEnd(cycleStart);
-
+  
+  
+  runFSM();
+  delay(1);
 }
 

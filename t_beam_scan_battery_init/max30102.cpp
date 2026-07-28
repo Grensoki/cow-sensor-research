@@ -46,15 +46,15 @@ bool HRSensor::update(){
     if(checkForBeat(_irValue)){
         unsigned long now = millis();
 
-        if(_lastbeat != 0){
-            unsigned long delta = now - _lastbeat;
+        if(_lastBeat != 0){
+            unsigned long delta = now - _lastBeat;
             float newBPM = 60000.0f / delta;
 
             if(newBPM > 30.0f && newBPM < 255.0f){
                  _beatsPerMinute = newBPM;
 
-                 _rates[rateSpot++] = static_cast<byte>(_beatsPerMinute);
-                 rateSpot %= RATE_SIZE;
+                 _rates[_rateSpot++] = static_cast<byte>(_beatsPerMinute);
+                 _rateSpot %= RATE_SIZE;
 
                  if(_beatCount < RATE_SIZE){
                     _beatCount++;
